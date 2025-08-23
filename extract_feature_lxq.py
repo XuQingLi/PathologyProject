@@ -1,28 +1,4 @@
-#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-extract_features_fp.py
-一次提取，双用途保存：
-  1) H5:   coords + {c2,c3,c4,c5}/features + meta
-  2) Zarr: 稠密网格 (c2,c3,c4) + 覆盖掩码 + MIL 向量 mil/emb & mil/coords + 可选 cls_c5_gap
-
-依赖：
-  pip install openslide-python h5py zarr numcodecs tifffile pillow torchvision torch tqdm
-
-用法示例：
-  python extract_features_fp.py \
-      --slide_dir /path/to/slides \
-      --out_dir   /path/to/out \
-      --gpus 0,1 --num_workers 2 \
-      --device cuda \
-      --patch 224 --stride 224 \
-      --batch_size 64
-
-与 downstream 对接：
-  - 分割推理：传 zarr_dir=.../slide.zarr 给你的 stream_decode_eval_png()（已支持 Zarr 快速切片）
-  - MIL 分类：读 slide.zarr/mil/{emb,coords}
-"""
-
 import os
 import sys
 import json
@@ -107,11 +83,20 @@ class ResNet50C245(nn.Module):
         return c2, c3, c4, c5
 
 # -----------------------
-# H5 写入器（可扩展）
+# H5 写入器（原子落盘）
 # -----------------------
 class H5FeatureWriter:
     def __init__(self, out_path: str, input_size: Tuple[int,int], downsample: dict):
-        self.f = h5py.File(out_path, "w")
+        # 原子写到临时文件，关闭后再 rename 到最终路径
+        self.final_path = out_path
+        base_dir = os.path.dirname(out_path)
+        os.makedirs(base_dir, exist_ok=True)
+        self.tmp_path = out_path + f".tmp-{os.getpid()}"
+
+        # 禁用 HDF5 文件锁，适配 NFS/并发环境
+        os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
+
+        self.f = h5py.File(self.tmp_path, "w", libver="latest")
         self.f.create_group("meta")
         # 存 meta 到 attrs（与现有管线兼容）
         self.f["meta"].attrs["input_size"] = json.dumps([int(input_size[0]), int(input_size[1])])
@@ -170,10 +155,15 @@ class H5FeatureWriter:
         self._n += B
 
     def close(self):
-        self.f.close()
+        # 先关闭，再原子替换
+        try:
+            self.f.flush()
+            self.f.close()
+        finally:
+            os.replace(self.tmp_path, self.final_path)
 
 # -----------------------
-# Zarr 导出（密集网格 + 覆盖掩码 + MIL 向量）
+# Zarr 导出（密集网格 + 覆盖掩码 + MIL 向量；临时目录→原子替换）
 # -----------------------
 def export_dense_feature_grids_to_zarr(
     h5_path: str,
@@ -187,8 +177,8 @@ def export_dense_feature_grids_to_zarr(
     max_chunk_bytes=64 * 1024 * 1024
 ):
     """
-    仅在“累加阶段”改为使用内存 numpy 数组，最终再一次性写入 Zarr。
-    其余行为、输出结构保持不变（包含 mask 与 mil/cls 向量）。
+    累加阶段使用内存 numpy 数组，最终再一次性写入 Zarr；
+    .zarr 写入到临时目录，完成后 os.replace 原子替换，避免半成品。
     """
     import zarr
     from numcodecs import Blosc
@@ -197,7 +187,6 @@ def export_dense_feature_grids_to_zarr(
     if os.path.isdir(out_zarr_dir) and not getattr(export_dense_feature_grids_to_zarr, "_overwrite", False) and getattr(export_dense_feature_grids_to_zarr, "_skip_if_done", True):
         print(f"[SKIP] Zarr 已存在：{out_zarr_dir}")
         return
-    os.makedirs(out_zarr_dir, exist_ok=True)
 
     compressor = Blosc(cname="zstd", clevel=5, shuffle=Blosc.SHUFFLE)
 
@@ -211,6 +200,13 @@ def export_dense_feature_grids_to_zarr(
             c = max(1, c // 2)
         return (max(1, c), max(1, h), max(1, w))
 
+    # 目标目录使用临时目录，写完后原子改名
+    final_dir = out_zarr_dir
+    tmp_dir = out_zarr_dir.rstrip("/\\") + f".tmp-{os.getpid()}"
+    if os.path.isdir(tmp_dir):
+        import shutil; shutil.rmtree(tmp_dir, ignore_errors=True)
+    os.makedirs(tmp_dir, exist_ok=True)
+
     slide = OpenSlide(slide_path)
     W_wsi, H_wsi = slide.level_dimensions[0]
     slide.close()
@@ -222,7 +218,7 @@ def export_dense_feature_grids_to_zarr(
         H_in, W_in = meta.get("input_size", [256,256])
         down = meta.get("downsample", {"c2":[4,4],"c3":[8,8],"c4":[16,16],"c5":[32,32]})
 
-        store = zarr.DirectoryStore(out_zarr_dir)
+        store = zarr.DirectoryStore(tmp_dir)
         root = zarr.group(store=store, overwrite=True)
         root.attrs["wsi_size"]   = (int(W_wsi), int(H_wsi))
         root.attrs["input_size"] = (int(H_in), int(W_in))
@@ -265,7 +261,7 @@ def export_dense_feature_grids_to_zarr(
             ds_c5 = (int(v[0]), int(v[1])) if isinstance(v, (list,tuple)) else (int(v), int(v))
             mil_grp.attrs["downsample"] = ds_c5
 
-        # ---- 稠密网格（改：内存累加 → 一次写回）----
+        # ---- 稠密网格（内存累加 → 一次写回）----
         for lname in layers:
             assert lname in f and "features" in f[lname], f"layer '{lname}/features' missing"
             feats_ds = f[f"{lname}/features"]  # (N, C, Hf, Wf)
@@ -275,7 +271,7 @@ def export_dense_feature_grids_to_zarr(
             Hf_glb = (H_wsi + ds_h - 1)//ds_h
             Wf_glb = (W_wsi + ds_w - 1)//ds_w
 
-            # —— 关键改动：用 numpy 内存数组做累加器（无压缩 I/O）——
+            # —— 内存累加器 —— 无压缩 I/O
             sum_arr_np = np.zeros((C, Hf_glb, Wf_glb), dtype=np.float32)
             cnt_arr_np = np.zeros((1, Hf_glb, Wf_glb), dtype=np.uint32)
 
@@ -329,9 +325,12 @@ def export_dense_feature_grids_to_zarr(
                 )
                 cover[...] = (cnt_arr_np[...] > 0).astype(np.uint8)
 
-    print(f"[OK] Dense feature grids (and MIL view) exported to: {out_zarr_dir}")
-
-
+    # —— 原子替换临时目录到最终目录 ——
+    import shutil
+    if os.path.isdir(final_dir) and getattr(export_dense_feature_grids_to_zarr, "_overwrite", False):
+        shutil.rmtree(final_dir, ignore_errors=True)
+    os.replace(tmp_dir, final_dir)
+    print(f"[OK] Dense feature grids (and MIL view) exported to: {final_dir}")
 
 # -----------------------
 # 主流程：遍历 slide_dir → 提特征 → 写 H5 → 导出 Zarr
@@ -386,6 +385,18 @@ def extract_one_slide(
     mask_big = np.array(Image.fromarray(mask_small.astype(np.uint8) * 255)
                         .resize((max(1, W // stride), max(1, H // stride)), Image.NEAREST)) > 0
 
+    # —— 覆盖率兜底，避免导出“全 0”稠密网格 ——
+    cover = float(mask_big.mean())
+    if cover < 1e-3:  # 覆盖 <0.1%
+        mask_small2 = (thumb_np < 240).any(axis=2)
+        mask_big2 = np.array(Image.fromarray(mask_small2.astype(np.uint8)*255)
+                     .resize((max(1, W // stride), max(1, H // stride)), Image.NEAREST)) > 0
+        if mask_big2.mean() > cover:
+            mask_big = mask_big2
+            cover = float(mask_big.mean())
+    if cover < 1e-4:
+        mask_big[:] = True  # 仍几乎全空，兜底设为全 True
+
     # 生成 coords 只保留 mask_big 为 True 的网格
     xs = list(range(0, W - patch + 1, stride))
     ys = list(range(0, H - patch + 1, stride))
@@ -436,7 +447,7 @@ def extract_one_slide(
             _flush_batch(batch_imgs, batch_coords, model, device, save_h5, h5w)
 
     slide.close()
-    if save_h5:
+    if save_h5 and h5w is not None:
         h5w.close()
 
     # 导出 Zarr（密集网格 + MIL）
@@ -456,7 +467,7 @@ def extract_one_slide(
             chunk_hw=256,
             save_cover_mask=True,
             save_cls_head=True
-        )                
+        )
 
 def _flush_batch(batch_imgs, batch_coords, model, device, save_h5, h5w:"H5FeatureWriter|None"):
     # 更友好的内存格式以提升吞吐
@@ -516,6 +527,9 @@ def _worker_one_slide(
     独立进程内执行：为该进程设置 CUDA 设备，实例化模型，运行 extract_one_slide。
     """
     try:
+        # 重要：子进程内也要关闭 HDF5 锁
+        os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
+
         if torch.cuda.is_available() and device.startswith("cuda"):
             gid = int(device.split(":")[-1])  # e.g., "cuda:1" -> 1
             torch.cuda.set_device(gid)
@@ -562,7 +576,8 @@ def main():
         mp.set_start_method("spawn", force=True)
     except Exception:
         pass
-    import os
+
+    # 重要：主进程也关闭 HDF5 锁
     os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
 
     ap = argparse.ArgumentParser()
