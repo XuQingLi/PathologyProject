@@ -7,6 +7,13 @@ import glob
 import argparse
 from typing import List, Tuple
 
+import uuid
+import shutil
+import errno
+import time
+import stat
+import datetime
+
 import numpy as np
 from PIL import Image
 from tqdm import tqdm
@@ -14,7 +21,7 @@ from tqdm import tqdm
 import h5py
 import zarr
 from numcodecs import Blosc
-import tifffile as tiff
+import tifffile as tiff  # 保持一致性，哪怕当前未直接使用
 
 import torch
 import torch.nn as nn
@@ -24,23 +31,115 @@ from torchvision import models, transforms
 from openslide import OpenSlide, OpenSlideError
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing as mp
-from concurrent.futures import ThreadPoolExecutor
-import uuid, shutil, errno, time
-import zarr
-from numcodecs import Blosc
-def _quarantine(path: str, root: str):
-    """把遗留半成品移到 out_dir/.trash-<ts>/basename，避免阻塞；失败则忽略"""
+
+# =========================
+# 实用工具（清理/收尾/兼容）
+# =========================
+def _rm_path_force(p: str):
+    """无论文件/目录，尽力删干净（含权限兜底）。"""
     try:
-        qdir = os.path.join(root, f".trash-{int(time.time())}")
-        os.makedirs(qdir, exist_ok=True)
-        dst = os.path.join(qdir, os.path.basename(path))
+        if os.path.isdir(p) and not os.path.islink(p):
+            shutil.rmtree(p, ignore_errors=True)
+        else:
+            os.unlink(p)
+    except FileNotFoundError:
+        return
+    except Exception:
         try:
-            os.rename(path, dst)          # 快：同盘 rename
-        except OSError:
-            shutil.move(path, dst)        # 跨盘 fallback
-        print(f"[IGNORE] stale tmp moved to {dst}")
-    except Exception as e:
-        print(f"[WARN] quarantine failed for {path}: {e}")
+            os.chmod(p, stat.S_IWUSR | stat.S_IRUSR | stat.S_IXUSR)
+            if os.path.isdir(p) and not os.path.islink(p):
+                shutil.rmtree(p, ignore_errors=True)
+            else:
+                os.unlink(p)
+        except Exception:
+            pass
+
+def _safe_finalize_dir(tmp_dir: str, final_dir: str, overwrite: bool) -> bool:
+    """
+    把 tmp_dir -> final_dir：
+      1) 优先 os.replace（原子）
+      2) 失败则强制清理 final 后重试
+      3) 再失败则 copytree
+      4) 仍失败：保留失败件，改名为 *.failed-<ts>
+    返回 True 表示产物已就位或被跳过（不再遗留 tmp）
+    """
+    parent = os.path.dirname(final_dir)
+    os.makedirs(parent, exist_ok=True)
+
+    # 目标已存在
+    if os.path.exists(final_dir):
+        if overwrite:
+            _rm_path_force(final_dir)
+        else:
+            # 允许跳过：删除 tmp，直接成功返回
+            _rm_path_force(tmp_dir)
+            print(f"[SKIP] Zarr exists: {final_dir}")
+            return True
+
+    # 1) 原子替换
+    try:
+        os.replace(tmp_dir, final_dir)
+        return True
+    except Exception as e1:
+        # 2) 清理再试
+        try:
+            _rm_path_force(final_dir)
+            os.replace(tmp_dir, final_dir)
+            return True
+        except Exception as e2:
+            # 3) fallback: copytree
+            try:
+                shutil.copytree(tmp_dir, final_dir)
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+                print(f"[WARN] os.replace failed ({e1} / {e2}); used copytree fallback.")
+                return True
+            except Exception as e3:
+                # 4) 保留失败件（仅 1 份）
+                ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+                failed_dir = f"{final_dir}.failed-{ts}"
+                try:
+                    os.rename(tmp_dir, failed_dir)
+                    print(f"[FAIL] finalize: kept partial at {failed_dir}  ({e1} / {e2} / {e3})")
+                except Exception:
+                    print(f"[FAIL] finalize: kept partial at {tmp_dir}  ({e1} / {e2} / {e3})")
+                return False
+
+def _safe_finalize_file(tmp_path: str, final_path: str, overwrite: bool) -> bool:
+    """H5 收尾：不再丢 .trash；目标存在且跳过则删除 tmp。"""
+    base_dir = os.path.dirname(final_path)
+    os.makedirs(base_dir, exist_ok=True)
+
+    if os.path.exists(final_path):
+        if overwrite:
+            _rm_path_force(final_path)
+        else:
+            _rm_path_force(tmp_path)
+            print(f"[SKIP] H5 exists: {final_path}")
+            return True
+
+    try:
+        os.replace(tmp_path, final_path)
+        return True
+    except Exception as e1:
+        try:
+            _rm_path_force(final_path)
+            os.replace(tmp_path, final_path)
+            return True
+        except Exception as e2:
+            try:
+                shutil.copy2(tmp_path, final_path)
+                _rm_path_force(tmp_path)
+                print(f"[WARN] H5 os.replace failed ({e1}/{e2}); used copy fallback.")
+                return True
+            except Exception as e3:
+                _rm_path_force(tmp_path)  # 最终失败也删除 tmp，避免遗留
+                print(f"[FAIL] finalize H5 failed ({e1}/{e2}/{e3}); tmp removed.")
+                return False
+
+def _quarantine(path: str, root: str):
+    """兼容旧调用，但不再制造 .trash-*；直接清理。"""
+    _rm_path_force(path)
+    print(f"[CLEAN] removed stale tmp: {path}")
 
 def _json_load_maybe(x):
     if isinstance(x, (bytes, str)):
@@ -55,19 +154,15 @@ def is_wsi_file(name: str) -> bool:
     return low.endswith((".tif", ".tiff", ".svs"))
 
 def tissue_ratio(rgb: np.ndarray, thr: int = 220) -> float:
-    """
-    粗略组织检测：统计像素是否"非亮背景"的比例，用于跳过大块空白区域。
-    rgb: HxWx3, uint8
-    """
+    """粗略组织检测：统计像素是否非亮背景的比例。"""
     if rgb.ndim != 3 or rgb.shape[2] != 3:
         return 0.0
-    # 简单阈值：任一通道小于 thr 视作非背景
     mask = (rgb < thr).any(axis=2)
     return float(mask.mean())
 
-# -----------------------
+# =========================
 # 编码器（返回 c2..c5）
-# -----------------------
+# =========================
 class ResNet50C245(nn.Module):
     """
     ResNet50 提取 c2..c5：
@@ -79,16 +174,13 @@ class ResNet50C245(nn.Module):
     def __init__(self, pretrained=True):
         super().__init__()
         m = models.resnet50(weights=models.ResNet50_Weights.IMAGENET1K_V2 if pretrained else None)
-        # stem
         self.stem = nn.Sequential(m.conv1, m.bn1, m.relu, m.maxpool)
-        # layers
         self.layer1 = m.layer1  # c2
         self.layer2 = m.layer2  # c3
         self.layer3 = m.layer3  # c4
         self.layer4 = m.layer4  # c5
 
     def forward(self, x):
-        # x: [B,3,H,W] (e.g., 224)
         x = self.stem(x)       # /4
         c2 = self.layer1(x)    # /4
         c3 = self.layer2(c2)   # /8
@@ -96,27 +188,28 @@ class ResNet50C245(nn.Module):
         c5 = self.layer4(c4)   # /32
         return c2, c3, c4, c5
 
+# =========================
+# H5 Writer（稳健 finalize）
+# =========================
 class H5FeatureWriter:
     def __init__(self, out_path: str, input_size: Tuple[int,int], downsample: dict):
-        # 原子写到临时文件，关闭后再 rename 到最终路径
         self.final_path = out_path
         base_dir = os.path.dirname(out_path)
         os.makedirs(base_dir, exist_ok=True)
-        # self.tmp_path = out_path + f".tmp-{os.getpid()}"
         self.tmp_path = out_path + f".tmp-{os.getpid()}-{uuid.uuid4().hex[:6]}"
-
 
         # 禁用 HDF5 文件锁，适配 NFS/并发环境
         os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
 
         self.f = h5py.File(self.tmp_path, "w", libver="latest")
         self.f.create_group("meta")
-        # 存 meta 到 attrs（与现有管线兼容）
         self.f["meta"].attrs["input_size"] = json.dumps([int(input_size[0]), int(input_size[1])])
         self.f["meta"].attrs["downsample"] = json.dumps({k: list(map(int, v)) for k, v in downsample.items()})
         self.coords_ds = None
         self._n = 0
         self._layers = {}
+        # 默认不覆盖；由调用方在需要时设置 self._overwrite_ = True
+        self._overwrite_ = False
 
     def _ensure_layer(self, name: str, C: int, Hf: int, Wf: int, chunk_N: int = 256):
         if name not in self._layers:
@@ -126,7 +219,7 @@ class H5FeatureWriter:
                 shape=(0, C, Hf, Wf),
                 maxshape=(None, C, Hf, Wf),
                 chunks=(chunk_N, C, Hf, Wf),
-                dtype="float16",  # 存半精度：省空间
+                dtype="float16",
                 compression="gzip", compression_opts=4
             )
             self._layers[name] = dset
@@ -143,18 +236,12 @@ class H5FeatureWriter:
             )
 
     def append_batch(self, coords_xy: np.ndarray, feats: dict):
-        """
-        coords_xy: (B,2) int32 (x,y)
-        feats: {"c2": np.float32/16 [B,C,Hf,Wf], ...}
-        """
         B = coords_xy.shape[0]
-        # 扩 coords
         self._ensure_coords()
         n0 = self.coords_ds.shape[0]
         self.coords_ds.resize((n0 + B, 2))
         self.coords_ds[n0:n0+B] = coords_xy.astype("int32")
 
-        # 各层
         for name, arr in feats.items():
             B_, C, Hf, Wf = arr.shape
             assert B_ == B
@@ -162,7 +249,6 @@ class H5FeatureWriter:
             dset = self._layers[name]
             n0 = dset.shape[0]
             dset.resize((n0 + B, C, Hf, Wf))
-            # 存 float16
             dset[n0:n0+B] = arr.astype(np.float16)
 
         self._n += B
@@ -172,35 +258,12 @@ class H5FeatureWriter:
             self.f.flush()
             self.f.close()
         finally:
-            try:
-                # 成品已存在且我们不覆盖：直接丢弃 tmp（忽略半成品）
-                if os.path.exists(self.final_path) and not getattr(self, "_overwrite_", False):
-                    _quarantine(self.tmp_path, os.path.dirname(self.final_path))
-                    return
-                # 正常原子替换
-                os.replace(self.tmp_path, self.final_path)
-            except Exception as e:
-                # 原子替换失败：降级为复制；再失败就隔离 tmp 并忽略
-                try:
-                    tmp = self.tmp_path
-                    dst = self.final_path
-                    if os.path.isdir(tmp):
-                        if os.path.exists(dst):
-                            shutil.rmtree(dst, ignore_errors=True)
-                        shutil.copytree(tmp, dst)
-                        shutil.rmtree(tmp, ignore_errors=True)
-                    else:
-                        shutil.copy2(tmp, dst)
-                        os.unlink(tmp)
-                    print(f"[WARN] os.replace failed ({e}); fell back to copy.")
-                except Exception as e2:
-                    _quarantine(self.tmp_path, os.path.dirname(self.final_path))
-                    print(f"[WARN] copy fallback failed ({e2}); tmp quarantined, slide ignored.")
+            overwrite = bool(getattr(self, "_overwrite_", False))
+            _safe_finalize_file(self.tmp_path, self.final_path, overwrite)
 
-
-# -----------------------
-# Zarr 导出（密集网格 + 覆盖掩码 + MIL 向量；临时目录→原子替换）
-# -----------------------
+# =========================
+# Zarr 导出（密集网格 + 覆盖掩码 + MIL 向量）
+# =========================
 def export_dense_feature_grids_to_zarr(
     h5_path: str,
     slide_path: str,
@@ -214,16 +277,21 @@ def export_dense_feature_grids_to_zarr(
 ):
     """
     累加阶段使用内存 numpy 数组，最终再一次性写入 Zarr；
-    .zarr 写入到临时目录，完成后 os.replace 原子替换，避免半成品。
+    .zarr 写入到临时目录，完成后 os.replace 原子替换。
     """
-
-        # 目标目录使用临时目录，写完后原子改名
     final_dir = out_zarr_dir
-    tmp_dir = out_zarr_dir.rstrip("/\\") + f".tmp-{os.getpid()}"
-    # 若目录存在且未要求覆盖，则跳过
-    if os.path.isdir(out_zarr_dir) and not getattr(export_dense_feature_grids_to_zarr, "_overwrite", False) and getattr(export_dense_feature_grids_to_zarr, "_skip_if_done", True):
-        print(f"[SKIP] Zarr 已存在：{out_zarr_dir}")
+    tmp_dir   = out_zarr_dir.rstrip("/\\") + f".tmp-{os.getpid()}"
+
+    # 若目录存在且允许跳过：直接返回（兼容原语义）
+    if os.path.isdir(final_dir) and getattr(export_dense_feature_grids_to_zarr, "_skip_if_done", True) \
+       and not getattr(export_dense_feature_grids_to_zarr, "_overwrite", False):
+        print(f"[SKIP] Zarr exists (ignore tmp): {final_dir}")
         return
+
+    # 清理历史 tmp（不再 quarantine）
+    if os.path.exists(tmp_dir):
+        _rm_path_force(tmp_dir)
+    os.makedirs(tmp_dir, exist_ok=True)
 
     compressor = Blosc(cname="zstd", clevel=5, shuffle=Blosc.SHUFFLE)
 
@@ -236,27 +304,8 @@ def export_dense_feature_grids_to_zarr(
         while c * h * w * itemsize > cap and c > 1:
             c = max(1, c // 2)
         return (max(1, c), max(1, h), max(1, w))
-    
-    # 忽略已存在的成品
-    if os.path.isdir(final_dir) and getattr(export_dense_feature_grids_to_zarr, "_skip_if_done", True):
-        print(f"[SKIP] Zarr exists (ignore stale tmp): {final_dir}")
-        return
 
-    # 遇到遗留 tmp，先尝试隔离；失败则改用新的 tmp 路径继续，避免卡死
-    if os.path.isdir(tmp_dir):
-        try:
-            _quarantine(tmp_dir, os.path.dirname(final_dir))
-        except Exception:
-            # 改一个全新 tmp 目录名，避免命名冲突
-            tmp_dir = final_dir.rstrip("/\\") + f".tmp-{os.getpid()}-{uuid.uuid4().hex[:6]}"
-            os.makedirs(tmp_dir, exist_ok=True)
-
-
-
-    if os.path.isdir(tmp_dir):
-        import shutil; shutil.rmtree(tmp_dir, ignore_errors=True)
-    os.makedirs(tmp_dir, exist_ok=True)
-
+    # 读取 WSI 尺寸
     slide = OpenSlide(slide_path)
     W_wsi, H_wsi = slide.level_dimensions[0]
     slide.close()
@@ -280,7 +329,7 @@ def export_dense_feature_grids_to_zarr(
             feats_c5 = f["c5/features"]  # (N, C5, Hf5, Wf5)
             N_c5, C5, Hf5, Wf5 = feats_c5.shape
 
-            # GAP 后求 slide 级向量（分块避免一次性内存过大）
+            # GAP 后求 slide 级向量
             sum_vec = np.zeros((C5,), dtype=np.float64); cnt = 0
             bs = 1024
             for s in range(0, N_c5, bs):
@@ -321,7 +370,6 @@ def export_dense_feature_grids_to_zarr(
             Hf_glb = (H_wsi + ds_h - 1)//ds_h
             Wf_glb = (W_wsi + ds_w - 1)//ds_w
 
-            # —— 内存累加器 —— 无压缩 I/O
             sum_arr_np = np.zeros((C, Hf_glb, Wf_glb), dtype=np.float32)
             cnt_arr_np = np.zeros((1, Hf_glb, Wf_glb), dtype=np.uint32)
 
@@ -334,7 +382,6 @@ def export_dense_feature_grids_to_zarr(
                 arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
                 xs = xs_patch[s:e]; ys = ys_patch[s:e]
 
-                # 小切片在内存里累加，速度极快
                 for i in range(e - s):
                     x0 = int(xs[i]); y0 = int(ys[i])
                     y1 = y0 + Hf; x1 = x0 + Wf
@@ -348,14 +395,12 @@ def export_dense_feature_grids_to_zarr(
                     sum_arr_np[:, yy0:yy1, xx0:xx1] += patch
                     cnt_arr_np[:, yy0:yy1, xx0:xx1] += 1
 
-            # —— 写回：创建最终 Zarr 数据集并分块写入（一次性）——
             den_c, den_h, den_w = _choose_chunks(C, Hf_glb, Wf_glb, itemsize=(2 if str(dtype)=="float16" else 4))
             dense = root.create_dataset(
                 f"{lname}", shape=(C, Hf_glb, Wf_glb),
                 chunks=(den_c, den_h, den_w),
                 dtype=dtype, compressor=compressor
             )
-            # 平均并写入
             step_h, step_w = den_h, den_w
             for y in range(0, Hf_glb, step_h):
                 y1 = min(Hf_glb, y+step_h)
@@ -375,33 +420,17 @@ def export_dense_feature_grids_to_zarr(
                 )
                 cover[...] = (cnt_arr_np[...] > 0).astype(np.uint8)
 
-    # —— 原子替换临时目录到最终目录 ——
-    import shutil
-    if os.path.isdir(final_dir) and getattr(export_dense_feature_grids_to_zarr, "_overwrite", False):
-        shutil.rmtree(final_dir, ignore_errors=True)
-    # os.replace(tmp_dir, final_dir)
-    try:
-        if os.path.isdir(final_dir) and getattr(export_dense_feature_grids_to_zarr, "_skip_if_done", True):
-            # 成品已在，忽略本次 tmp
-            _quarantine(tmp_dir, os.path.dirname(final_dir))
-        else:
-            os.replace(tmp_dir, final_dir)
-    except Exception as e:
-        try:
-            if os.path.exists(final_dir):
-                shutil.rmtree(final_dir, ignore_errors=True)
-            shutil.copytree(tmp_dir, final_dir)
-            shutil.rmtree(tmp_dir, ignore_errors=True)
-            print(f"[WARN] os.replace failed ({e}); fell back to copy.")
-        except Exception as e2:
-            _quarantine(tmp_dir, os.path.dirname(final_dir))
-            print(f"[WARN] copy fallback failed ({e2}); tmp quarantined, slide ignored.")
+    # —— 稳健 finalize（不再 quarantine；目标存在且 skip 则删 tmp）——
+    overwrite = bool(getattr(export_dense_feature_grids_to_zarr, "_overwrite", False))
+    ok = _safe_finalize_dir(tmp_dir, final_dir, overwrite)
+    if ok:
+        print(f"[OK] Dense feature grids (and MIL view) exported to: {final_dir}")
+    else:
+        print(f"[FAIL] Exported store kept as *.failed-* for manual recovery: {final_dir}")
 
-    print(f"[OK] Dense feature grids (and MIL view) exported to: {final_dir}")
-
-# -----------------------
-# 主流程：遍历 slide_dir → 提特征 → 写 H5 → 导出 Zarr
-# -----------------------
+# =========================
+# 主流程：提特征 → 写 H5 → 导出 Zarr
+# =========================
 def extract_one_slide(
     slide_path: str,
     out_dir: str,
@@ -419,15 +448,15 @@ def extract_one_slide(
     h5_path = os.path.join(out_dir, f"{slide_id}.h5")
     zarr_dir = os.path.join(out_dir, f"{slide_id}.zarr")
 
-    # 若成品已存在而且允许跳过：直接跳过该 slide（忽略任何遗留 tmp）
-    if os.path.isfile(h5_path) and os.path.isdir(zarr_dir) and getattr(extract_one_slide, "_skip_if_done", True):
-        print(f"[SKIP] H5 & Zarr exist, ignore stale tmp: {os.path.basename(slide_path)}")
+    # 若成品已存在而且允许跳过：直接跳过该 slide
+    if os.path.isfile(h5_path) and os.path.isdir(zarr_dir) and getattr(extract_one_slide, "_skip_if_done", True) \
+       and not getattr(extract_one_slide, "_overwrite", False):
+        print(f"[SKIP] H5 & Zarr exist: {os.path.basename(slide_path)}")
         return
 
-    # 若仅有遗留 tmp：隔离它们，避免后续 os.replace 冲突
-    for p in (h5_path + f".tmp-{os.getpid()}", zarr_dir + f".tmp-{os.getpid()}"):
-        if os.path.exists(p):
-            _quarantine(p, os.path.dirname(zarr_dir))
+    # 清理所有历史 tmp（跨 pid），避免冲突与膨胀
+    for p in glob.glob(h5_path + ".tmp-*") + glob.glob(zarr_dir + ".tmp-*"):
+        _rm_path_force(p)
 
     # 跳过策略（分情形）
     if save_h5 and not export_zarr:
@@ -452,8 +481,8 @@ def extract_one_slide(
     W, H = slide.level_dimensions[0]
     print(f"[INFO] slide={slide_id} size=({W},{H})")
 
-    # 缩略掩码（更大的 down 速度更快）
-    thumb_down = 32  # 或 64/96（越大越快，掩码更粗）
+    # 缩略掩码
+    thumb_down = 32
     tw, th = max(1, W // thumb_down), max(1, H // thumb_down)
     thumb = slide.get_thumbnail((tw, th)).convert("RGB")
     thumb_np = np.array(thumb)
@@ -461,7 +490,7 @@ def extract_one_slide(
     mask_big = np.array(Image.fromarray(mask_small.astype(np.uint8) * 255)
                         .resize((max(1, W // stride), max(1, H // stride)), Image.NEAREST)) > 0
 
-    # —— 覆盖率兜底，避免导出“全 0”稠密网格 ——
+    # 覆盖率兜底
     cover = float(mask_big.mean())
     if cover < 1e-3:
         mask_small2 = (thumb_np < 240).any(axis=2)
@@ -471,9 +500,8 @@ def extract_one_slide(
             mask_big = mask_big2
             cover = float(mask_big.mean())
     if cover < 1e-4:
-        mask_big[:] = True  # 仍几乎全空，兜底设为全 True
+        mask_big[:] = True
 
-    # 生成 coords 只保留 mask_big 为 True 的网格
     xs = list(range(0, W - patch + 1, stride))
     ys = list(range(0, H - patch + 1, stride))
     coords = [(x, y) for j, y in enumerate(ys) for i, x in enumerate(xs) if mask_big[j, i]]
@@ -492,11 +520,9 @@ def extract_one_slide(
         except Exception:
             pass
 
-    # —— 延迟创建 H5：仅当首次真正写入时再创建 ——
     h5w_box = {"obj": None}
     downsample = {"c2": [4,4], "c3": [8,8], "c4": [16,16], "c5": [32,32]}
 
-    # 扫描
     batch_imgs: List[torch.Tensor] = []
     batch_coords: List[Tuple[int,int]] = []
 
@@ -505,18 +531,16 @@ def extract_one_slide(
             rgba = np.array(slide.read_region((x, y), 0, (patch, patch)))  # RGBA
             rgb = rgba[..., :3].astype(np.uint8)
 
-            # 二次筛空白（可酌情关闭以提速）
             if tissue_ratio(rgb) < tissue_thr:
                 continue
 
-            batch_imgs.append(rgb)              # np.uint8, HxWx3
+            batch_imgs.append(rgb)
             batch_coords.append((x, y))
 
             if len(batch_imgs) >= batch_size:
                 _flush_batch(batch_imgs, batch_coords, model, device, save_h5,
                              h5w_box, h5_path, (patch, patch), downsample)
 
-        # 收尾
         if len(batch_imgs) > 0:
             _flush_batch(batch_imgs, batch_coords, model, device, save_h5,
                          h5w_box, h5_path, (patch, patch), downsample)
@@ -531,7 +555,7 @@ def extract_one_slide(
             print(f"[ERR] cannot export Zarr without H5: set save_h5=True for {slide_id}")
             return
 
-        # —— 导出前：确保 H5 真有数据（避免 AssertionError） ——
+        # —— 导出前：确保 H5 真有数据 ——
         with h5py.File(h5_path, "r") as _fchk:
             ok_layers = []
             for _k in ("c2","c3","c4","c5"):
@@ -547,7 +571,6 @@ def extract_one_slide(
                     print(f"[WARN] failed to remove empty H5: {h5_path} ({_e})")
                 return
 
-        # 先注入覆盖/跳过策略，再调用
         export_dense_feature_grids_to_zarr._overwrite    = getattr(extract_one_slide, "_overwrite", False)
         export_dense_feature_grids_to_zarr._skip_if_done = getattr(extract_one_slide, "_skip_if_done", True)
         export_dense_feature_grids_to_zarr(
@@ -561,14 +584,12 @@ def extract_one_slide(
             save_cls_head=True
         )
 
-
 def _flush_batch(batch_imgs, batch_coords, model, device, save_h5, h5w_box, h5_path, input_size, downsample):
-    # batch_imgs: list[np.uint8(H,W,3)]
-    # 1) CPU: list -> tensor
-    imgs_cpu = [torch.from_numpy(x).permute(2,0,1).contiguous() for x in batch_imgs]  # [B,3,H,W], uint8
+    # CPU: list -> tensor
+    imgs_cpu = [torch.from_numpy(x).permute(2,0,1).contiguous() for x in batch_imgs]
     imgs = torch.stack(imgs_cpu, dim=0)  # uint8
 
-    # 2) GPU 归一化
+    # GPU 归一化
     imgs = imgs.to(device, non_blocking=True, memory_format=torch.channels_last).float().div_(255.0)
     mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1,3,1,1)
     std  = torch.tensor([0.229, 0.224, 0.225], device=device).view(1,3,1,1)
@@ -578,7 +599,6 @@ def _flush_batch(batch_imgs, batch_coords, model, device, save_h5, h5w_box, h5_p
     with torch.amp.autocast("cuda", enabled=use_cuda):
         c2, c3, c4, c5 = model(imgs)
 
-    # 转 numpy（B,C,Hf,Wf）
     def to_np(t: torch.Tensor) -> np.ndarray:
         return t.detach().float().cpu().numpy()
 
@@ -590,25 +610,24 @@ def _flush_batch(batch_imgs, batch_coords, model, device, save_h5, h5w_box, h5_p
     }
     coords_xy = np.array(batch_coords, dtype="int32")
 
-    # —— 首次真正写入时再创建 H5Writer（避免空壳 H5） ——
+    # —— 首次真正写入时再创建 H5Writer ——
     if save_h5:
         if h5w_box["obj"] is None:
             h5w_box["obj"] = H5FeatureWriter(h5_path, input_size, downsample)
+            # 让 H5 finalize 行为跟随 extract_one_slide 的覆盖策略
+            h5w_box["obj"]._overwrite_ = getattr(extract_one_slide, "_overwrite", False)
         h5w_box["obj"].append_batch(coords_xy, feats)
 
-    # 清空批缓存
     batch_imgs.clear()
     batch_coords.clear()
 
-    # 显存回收更稳
     del imgs, c2, c3, c4, c5
     if use_cuda:
         torch.cuda.empty_cache()
 
-
-# -----------------------
+# =========================
 # 并行辅助
-# -----------------------
+# =========================
 def _parse_gpus(gpus_str: str):
     if not gpus_str:
         return [f"{i}" for i in range(torch.cuda.device_count())]
@@ -629,15 +648,12 @@ def _worker_one_slide(
     device: str,
     args_dict: dict
 ):
-    """
-    独立进程内执行：为该进程设置 CUDA 设备，实例化模型，运行 extract_one_slide。
-    """
+    """独立进程内执行：为该进程设置 CUDA 设备，实例化模型，运行 extract_one_slide。"""
     try:
-        # 重要：子进程内也要关闭 HDF5 锁
         os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
 
         if torch.cuda.is_available() and device.startswith("cuda"):
-            gid = int(device.split(":")[-1])  # e.g., "cuda:1" -> 1
+            gid = int(device.split(":")[-1])
             torch.cuda.set_device(gid)
             torch.backends.cudnn.benchmark = True
             try:
@@ -645,18 +661,14 @@ def _worker_one_slide(
             except Exception:
                 pass
 
-        # 模型在子进程内各自创建，避免上下文冲突
         model = ResNet50C245(pretrained=not args_dict["no_pretrain"])
 
-        # 传递覆盖/跳过策略到函数属性（与主逻辑兼容）
         extract_one_slide._overwrite     = args_dict["overwrite"]
         extract_one_slide._skip_if_done  = args_dict["skip_if_done"]
 
-        # 同步到 Zarr 导出
         export_dense_feature_grids_to_zarr._overwrite    = args_dict["overwrite"]
         export_dense_feature_grids_to_zarr._skip_if_done = args_dict["skip_if_done"]
 
-        # 真正执行
         extract_one_slide(
             slide_path=slide_path,
             out_dir=out_dir,
@@ -673,17 +685,15 @@ def _worker_one_slide(
     except Exception as e:
         return (slide_path, "FAIL", str(e))
 
-# -----------------------
+# =========================
 # CLI / main
-# -----------------------
+# =========================
 def main():
-    # 多平台更稳的启动方式（尤其配合 PyTorch）
     try:
         mp.set_start_method("spawn", force=True)
     except Exception:
         pass
 
-    # 重要：主进程也关闭 HDF5 锁
     os.environ.setdefault("HDF5_USE_FILE_LOCKING", "FALSE")
 
     ap = argparse.ArgumentParser()
@@ -698,11 +708,9 @@ def main():
     ap.add_argument("--no_zarr",   action="store_true", help="不导出 Zarr（仅 H5）")
     ap.add_argument("--no_pretrain", action="store_true", help="ResNet50 不加载 ImageNet 预训练")
 
-    # 并行相关新增参数
     ap.add_argument("--gpus", type=str, default="", help="逗号分隔的 GPU id 列表，如 '0,1,2'；留空则使用全部可用 GPU")
     ap.add_argument("--num_workers", type=int, default=0, help="并发进程数；默认=GPU 数；CPU 或仅导出 H5 时可手动加大")
 
-    # 跳过/覆盖策略
     ap.add_argument("--overwrite", action="store_true", help="强制重算并覆盖已存在的产物")
     ap.add_argument("--skip_if_done", action="store_true", default=True, help="若目标产物已存在则跳过")
     args = ap.parse_args()
@@ -715,12 +723,10 @@ def main():
 
     gpu_ids = _parse_gpus(args.gpus) if torch.cuda.is_available() else []
     if (args.device.startswith("cuda") and not gpu_ids):
-        # 没有可用 GPU 时回退到 CPU
         print("[WARN] 未检测到可用 GPU，回退到 CPU。")
     if args.num_workers <= 0:
         args.num_workers = max(1, len(gpu_ids) if gpu_ids else max(1, (os.cpu_count() or 2) // 2))
 
-    # 汇总运行配置，传给子进程
     args_dict = dict(
         patch=args.patch,
         stride=args.stride,
@@ -733,21 +739,18 @@ def main():
         skip_if_done=args.skip_if_done,
     )
 
-    # 提交任务
     print(f"[INFO] slides={len(slides)}, gpus={gpu_ids if gpu_ids else 'CPU'}, workers={args.num_workers}")
-    futures = []
+    ok, fail = 0, 0
     with ProcessPoolExecutor(max_workers=args.num_workers) as ex:
+        futures = []
         for idx, sp in enumerate(slides):
             if gpu_ids and args.device.startswith("cuda"):
-                # 轮转分配 GPU
                 gid = gpu_ids[idx % len(gpu_ids)]
                 device = f"cuda:{gid}"
             else:
                 device = "cpu"
             futures.append(ex.submit(_worker_one_slide, sp, args.out_dir, device, args_dict))
 
-        # 汇总结果
-        ok, fail = 0, 0
         for fut in as_completed(futures):
             sp, status, msg = fut.result()
             if status == "OK":
